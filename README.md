@@ -10,3 +10,5 @@ OUT
 HLT
 ```
 NOTE: You must specify 'end' at the end of a program when running from terminal input.
+
+This project is experimental and is just to consolidate my knowledge, + it looks cool.
