@@ -1,4 +1,6 @@
-# TODO: Add buses
+from queue import Queue
+import time
+from colorama import Fore, Style
 
 # Constants
 BIT_RESOLUTION = 20
@@ -19,6 +21,47 @@ instructions = {
     "HLT":      0xB
 }
 
+def to_signed(value):
+    if value >= (1 << (BIT_RESOLUTION - 1)):
+        value -= (1 << BIT_RESOLUTION)
+    return value
+
+def to_unsigned(value):
+    if value < 0:
+        value += (1 << BIT_RESOLUTION)
+    return value & MAX_VALUE
+
+def clock(cu, frequency=1.0):
+    period = 1.0 / frequency
+    while True:
+        start_time = time.time()
+        cu.fetch()
+        cu.decode()
+        cu.execute()
+        elapsed_time = time.time() - start_time
+        time.sleep(max(0, period - elapsed_time))
+
+def prettyprint(cu):
+    print(Fore.YELLOW + "PC:" + Style.RESET_ALL, cu.pc.get())
+    print(Fore.YELLOW + "MAR:" + Style.RESET_ALL, cu.mar.get())
+    print(Fore.YELLOW + "MDR:" + Style.RESET_ALL, cu.mdr.get())
+    print(Fore.YELLOW + "CIR:" + Style.RESET_ALL, cu.cir.get())
+    print(Fore.YELLOW + "ACCUMULATOR:" + Style.RESET_ALL, cu.accumulator.get())
+    print(Fore.YELLOW + "RAM:" + Style.RESET_ALL)
+    print(Fore.YELLOW + "Variables:" + Style.RESET_ALL)
+    for key, value in cu.variables.items():
+        print(Fore.CYAN + f"{key}:" + Style.RESET_ALL, cu.ram.get(value))
+
+class Bus:
+    def __init__(self):
+        self.data = Queue()
+
+    def read(self):
+        return self.data.get()
+
+    def write(self, value):
+        self.data.put(value)
+
 class Transistor:
     def __init__(self):
         self.state = 0
@@ -35,53 +78,65 @@ class Transistor:
     def __repr__(self):
         return str(self.state)
 
-
 class Register:
-    def __init__(self, name):
-        # [0,1,0,0,1,0,0,1]
+    def __init__(self, name, bus):
         self.name = name
         self.data = [Transistor() for _ in range(BIT_RESOLUTION)]
+        self.bus = bus
 
     def get(self):
         value = 0
         for i in range(BIT_RESOLUTION):
-            # [0,1,0,0,1,0,0,1]
-            # value | 0
-            # value | 1 << 1 == value | 10
             value |= (self.data[i].get() << i)
-        return value
+        return to_signed(value)
 
     def set(self, value):
-        print(f"Setting {self.name} to {bin(value)}")
+        value = to_unsigned(value)
+        print(f"{Fore.GREEN}Setting {self.name} to {bin(value)}{Fore.RESET}")
         for i in range(BIT_RESOLUTION):
             self.data[i].set((value >> i) & 1)
 
+    def read_from_bus(self):
+        self.set(self.bus.read())
+
+    def write_to_bus(self):
+        self.bus.write(self.get())
 
 class RAM:
-    def __init__(self):
+    def __init__(self, bus):
         print(f"Initializing RAM of size {RAM_SIZE}")
         self.cells = [[Transistor() for _ in range(BIT_RESOLUTION)] for _ in range(RAM_SIZE)]
-        print(f"RAM of size {RAM_SIZE} initialized.")
+        self.bus = bus
+        print(f"{Fore.GREEN}RAM of size {RAM_SIZE} initialized.{Fore.RESET}")
 
     def get(self, address):
         value = 0
         for i in range(BIT_RESOLUTION):
             value |= (self.cells[address][i].get() << i)
-        return value
+        return to_signed(value)
     
     def set(self, address, value):
+        value = to_unsigned(value)
         for i in range(BIT_RESOLUTION):
             self.cells[address][i].set((value >> i) & 1)
 
+    def read_from_bus(self):
+        address = self.bus.read()
+        self.bus.write(self.get(address))
+
+    def write_to_bus(self):
+        address = self.bus.read()
+        value = self.bus.read()
+        self.set(address, value)
 
 class ALU:
     @staticmethod
     def add(val1, val2):
-        return (val1 + val2) & MAX_VALUE
+        return to_signed((to_unsigned(val1) + to_unsigned(val2)) & MAX_VALUE)
 
     @staticmethod
     def sub(val1, val2):
-        return (val1 - val2) & MAX_VALUE
+        return to_signed((to_unsigned(val1) - to_unsigned(val2)) & MAX_VALUE)
 
     @staticmethod
     def and_(val1, val2):
@@ -93,7 +148,7 @@ class ALU:
 
     @staticmethod
     def not_(val1):
-        return ~val1
+        return to_signed(~to_unsigned(val1))
     
     @staticmethod
     def xor_(val1, val2):
@@ -101,56 +156,80 @@ class ALU:
 
 class CU:
     def __init__(self):
-        self.pc = Register("PC")
-        self.mar = Register("MAR")
-        self.mdr = Register("MDR")
-        self.cir = Register("CIR")
-        self.accumulator = Register("ACCUMULATOR")
-        self.ram = RAM()
+        self.bus = Bus()
+        self.pc = Register("PC", self.bus)
+        self.mar = Register("MAR", self.bus)
+        self.mdr = Register("MDR", self.bus)
+        self.cir = Register("CIR", self.bus)
+        self.accumulator = Register("ACCUMULATOR", self.bus)
+        self.ram = RAM(self.bus)
         self.alu = ALU()
 
         self.variables = {}
         self.next_variable_address = RAM_SIZE-1
 
+        self.pipeline_fetch = None
+        self.pipeline_decode = None
+
     def fetch(self):
         self.mar.set(self.pc.get())
-        self.mdr.set(self.ram.get(self.mar.get()))
+        self.bus.write(self.mar.get())
+        self.ram.read_from_bus()
+        self.mdr.read_from_bus()
         self.pc.set(self.pc.get()+1)
-        self.cir.set(self.mdr.get())
+        self.pipeline_fetch = self.mdr.get()
 
-    def decode_execute(self):
-        # 4 bit opcode + 16 bit operand
-        # 0101 0101 0101 0101 0101
-        # 0000 1111 1111 1111 1111
-        #      0101 0101 0101 0101
-        instruction = self.cir.get()
-        opcode = (instruction >> 16) & 0xF
-        operand = instruction & 0xFFFF
+    def decode(self):
+        if self.pipeline_fetch is not None:
+            instruction = self.pipeline_fetch
+            opcode = (instruction >> 16) & 0xF
+            operand = instruction & 0xFFFF
+            self.pipeline_decode = (opcode, operand)
+            self.pipeline_fetch = None
 
-        if opcode == instructions["LDA"]:
-            self.accumulator.set(self.ram.get(operand))
-        elif opcode == instructions["STA"]:
-            self.ram.set(operand, self.accumulator.get())
-        elif opcode == instructions["ADD"]:
-            self.accumulator.set(self.alu.add(self.accumulator.get(), self.ram.get(operand)))
-        elif opcode == instructions["SUB"]:
-            self.accumulator.set(self.alu.sub(self.accumulator.get(), self.ram.get(operand)))
-        elif opcode == instructions["AND"]:
-            self.accumulator.set(self.alu.and_(self.accumulator.get(), self.ram.get(operand)))
-        elif opcode == instructions["OR"]:
-            self.accumulator.set(self.alu.or_(self.accumulator.get(), self.ram.get(operand)))
-        elif opcode == instructions["NOT"]:
-            self.accumulator.set(self.alu.not_(self.accumulator.get()))
-        elif opcode == instructions["XOR"]:
-            self.accumulator.set(self.alu.xor_(self.accumulator.get(), self.ram.get(operand)))
-        elif opcode == instructions["INP"]:
-            self.accumulator.set(int(input()))
-        elif opcode == instructions["OUT"]:
-            print("OUT:", self.accumulator.get())
-        elif opcode == instructions["HLT"]:
-            exit("Halt")
-        else:
-            raise ValueError(f"Invalid opcode")
+    def execute(self):
+        if self.pipeline_decode is not None:
+            opcode, operand = self.pipeline_decode
+            if opcode == instructions["LDA"]:
+                self.bus.write(operand)
+                self.ram.read_from_bus()
+                self.accumulator.read_from_bus()
+            elif opcode == instructions["STA"]:
+                self.bus.write(operand)
+                self.bus.write(self.accumulator.get())
+                self.ram.write_to_bus()
+            elif opcode == instructions["ADD"]:
+                self.bus.write(operand)
+                self.ram.read_from_bus()
+                self.accumulator.set(self.alu.add(self.accumulator.get(), self.bus.read()))
+            elif opcode == instructions["SUB"]:
+                self.bus.write(operand)
+                self.ram.read_from_bus()
+                self.accumulator.set(self.alu.sub(self.accumulator.get(), self.bus.read()))
+            elif opcode == instructions["AND"]:
+                self.bus.write(operand)
+                self.ram.read_from_bus()
+                self.accumulator.set(self.alu.and_(self.accumulator.get(), self.bus.read()))
+            elif opcode == instructions["OR"]:
+                self.bus.write(operand)
+                self.ram.read_from_bus()
+                self.accumulator.set(self.alu.or_(self.accumulator.get(), self.bus.read()))
+            elif opcode == instructions["NOT"]:
+                self.accumulator.set(self.alu.not_(self.accumulator.get()))
+            elif opcode == instructions["XOR"]:
+                self.bus.write(operand)
+                self.ram.read_from_bus()
+                self.accumulator.set(self.alu.xor_(self.accumulator.get(), self.bus.read()))
+            elif opcode == instructions["INP"]:
+                self.accumulator.set(int(input()))
+            elif opcode == instructions["OUT"]:
+                print("OUT:", self.accumulator.get())
+            elif opcode == instructions["HLT"]:
+                exit("Halt")
+            else:
+                raise ValueError(f"Invalid opcode")
+            self.pipeline_decode = None
+        prettyprint(self)
 
 def main():
     program = []
@@ -185,21 +264,7 @@ def main():
         cu.ram.set(i, program[i])
         print(f"{bin(cu.ram.get(i))}")
 
-    while True:
-        ram = open("ram.txt", "w")
-        for c in cu.ram.cells:
-            for t in c:
-                ram.write(str(t))
-            ram.write("\n")
-        ram.close()
-        print(f"PC:\t\t{bin(cu.pc.get())}")
-        print(f"MAR:\t\t{bin(cu.mar.get())}")
-        print(f"MDR:\t\t{bin(cu.mdr.get())}")
-        print(f"CIR:\t\t{bin(cu.cir.get())}")
-        print(f"Accumulator:\t{bin(cu.accumulator.get())}\n")
-
-        cu.fetch() 
-        cu.decode_execute()
+    clock(cu)
 
 if __name__ == '__main__':
     main()
